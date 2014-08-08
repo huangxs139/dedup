@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/times.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -10,6 +11,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <sqlite3.h>
+#include <time.h>
 #include "md5.h"
 #include "lpc.h"
 
@@ -30,8 +32,17 @@ typedef struct _CONTAINER {
 	int cp, cid;
 }CTR;
 
+typedef struct _OBSERVER {
+	clock_t st, ed;
+	struct timeval start, end;
+	int nr_seg, nr_hit, nr_sql, nr_new;
+	int f_ob;
+	char output[1000];
+}OB;
+
 BAK_CTX ctx;
 CTR ctr;
+OB ob;
 
 void init() {
 	memset(ctx.header, 0, sizeof(ctx.header));
@@ -39,6 +50,7 @@ void init() {
 	ctx.cp = 0;
 	memset(ctr.container, 0, sizeof(ctr.container));
 	ctr.cp = ctr.cid = 0;
+	ob.f_ob = open("./observer", O_RDWR | O_CREAT | O_TRUNC, 0777);
 }
 
 int callback (void *arg, int nr, char **value, char **name) {
@@ -58,6 +70,8 @@ int lookup(char *md5) {
 		sprintf(sql, "create table tb(md5 TEXT PRIMARY KEY, cid INTEGER)");
 		sqlite3_exec(db, sql, NULL, NULL, NULL);
 		sprintf(sql, "delete from tb");
+		sqlite3_exec(db, sql, NULL, NULL, NULL);
+		sprintf(sql, "create index idxMD5 on tb(md5)");
 		sqlite3_exec(db, sql, NULL, NULL, NULL);
 	}
 	sprintf(sql, "select cid from tb where md5=\"%s\"", md5);
@@ -117,10 +131,14 @@ int split(int fd, int bak) {
 		md5 = MD5String(buf);
 		if (-1 == (cid = LPCHit(md5))) {
 			if (-1 == (cid = lookup(md5))) {
+				ob.nr_new++;																//
 				cid = insert(md5, buf);
 			} else {
+				ob.nr_sql++;																//
 				replace(cid);
 			}	
+		} else {
+			ob.nr_hit++;																	//
 		}
 		memset(str, 0, sizeof(str));
 		sprintf(str, "%s,%d\n", md5, cid);
@@ -151,6 +169,9 @@ int dedup_reg(char *fullpath, int bak) {
 	int ret = 0;
 	char str[1000];
 	struct stat statbuf;
+	ob.nr_seg = ob.nr_hit = ob.nr_sql = ob.nr_new = 0;											//
+	ob.st = clock();																			//
+	gettimeofday(&ob.start, NULL);																//
 	printf("%s\n", fullpath);
 	if (-1 == (fd = open(fullpath, O_RDONLY))) {
 		perror("open regular file");
@@ -162,7 +183,14 @@ int dedup_reg(char *fullpath, int bak) {
 	write(bak, ctx.header, strlen(ctx.header));
 	memset(ctx.header, 0, sizeof(ctx.header));
 	ret |= split(fd, bak);
-
+	
+	ob.nr_seg = (int)(statbuf.st_size+SEG_SIZE-1)/SEG_SIZE;										//
+	ob.ed = clock();																			//
+	gettimeofday(&ob.end, NULL);																//
+	sprintf(ob.output, "%-10d %-8.2f %-8.2f %10d %10d %10d %8.2f %8.2f\n",
+		   	ob.nr_seg, (double)(ob.ed-ob.st)/CLOCKS_PER_SEC, (double)(ob.end.tv_sec-ob.start.tv_sec)+(double)(ob.end.tv_usec-ob.start.tv_usec)/1000000,
+			ob.nr_hit, ob.nr_sql, ob.nr_new, (double)(ob.nr_seg-ob.nr_new)/ob.nr_seg, (double)ob.nr_hit/ob.nr_new);
+	write(ob.f_ob, ob.output, strlen(ob.output));												//
 _DEDUP_REG_EXIT:
 	close(fd);
 	return ret;
@@ -228,5 +256,6 @@ int main(int argc, char *argv[]) {
 	
 _MAIN_EXIT:
 	close(bak);
+	close(ob.f_ob);
 	return ret;
 }
